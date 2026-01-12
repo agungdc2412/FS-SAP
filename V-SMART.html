@@ -14,11 +14,15 @@ import {
 } from 'recharts';
 
 // --- FIREBASE CONFIGURATION ---
-const firebaseConfig = JSON.parse(__firebase_config || '{}');
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const auth = getAuth(app);
-const appId = __app_id || 'default-app';
+const firebaseConfig = {
+  apiKey: "AIzaSyBSafCxeSzMOyLWWtfWWV-xowVrIJPjRVs",
+  authDomain: "v-smart-400e8.firebaseapp.com",
+  projectId: "v-smart-400e8",
+  storageBucket: "v-smart-400e8.firebasestorage.app",
+  messagingSenderId: "976909000666",
+  appId: "1:976909000666:web:e1394fbd45293e8dfcaae3",
+  measurementId: "G-MSEW7HP2CR"
+};
 
 // --- CONFIGURATION PER MODULE ---
 const MODULES = {
@@ -712,4 +716,5 @@ export default function App() {
       `}</style>
     </div>
   );
+
 }
