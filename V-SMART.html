@@ -1,0 +1,715 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, orderBy, writeBatch 
+} from 'firebase/firestore';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { 
+  LayoutDashboard, UploadCloud, Table as TableIcon, Trash2, FileDown, 
+  Search, Eye, X, ChevronLeft, ChevronRight, BarChart3, PieChart, CheckSquare, Square, AlertCircle, CheckCircle2,
+  Settings, SlidersHorizontal, ArrowRight, Layers, Box, MapPin
+} from 'lucide-react';
+import { 
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, PieChart as RePieChart, Pie, Cell 
+} from 'recharts';
+
+// --- FIREBASE CONFIGURATION ---
+const firebaseConfig = JSON.parse(__firebase_config || '{}');
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+const appId = __app_id || 'default-app';
+
+// --- CONFIGURATION PER MODULE ---
+const MODULES = {
+  EQUIPMENT: 'equipment',
+  FUNCLOC: 'funcloc'
+};
+
+const MODULE_CONFIG = {
+  [MODULES.EQUIPMENT]: {
+    name: "Equipment",
+    collection: "equipment_assets",
+    icon: Box,
+    color: "blue",
+    defaultCols: [
+      "Equipment Category", "Description", "Object Type", "Serial Number", 
+      "Manufacturer", "Maintenance Plant", "Plant Section (Kota/Kab)", "Functional Location"
+    ],
+    templateHeaders: [
+      "Equipment Category", "Description", "Object Type", "TechIdentNo. [TBC]", 
+      "Sort Field (Project ID)", "Inventory No. (CRT ID)", "Object Size", 
+      "Start-up Date", "Manufacturer", "Model Number", "Mfr Ctry/Reg", 
+      "ManufPartNo.", "Construction Year", "Construction Month", 
+      "Construction Type (Material Number)", "Serial Number", "Maintenance Plant",
+      "Location (Kecamatan)", "Plant Section (Kota/Kab)", "Work Center",
+      "Asset Number", "Asset Subnumber", "Cost Center", "Planning Plant",
+      "Functional Location", "Superord. Equipment", "Class", "Customer", 
+      "End-customer", "Paket Layanan [TBC]", "Address", "City", 
+      "Location", "Layanan ID", "Cust. Site ID", "Remark Duplikat", "PIC Collect Data"
+    ]
+  },
+  [MODULES.FUNCLOC]: {
+    name: "Functional Location",
+    collection: "functional_locations",
+    icon: MapPin,
+    color: "emerald",
+    defaultCols: [
+      "Functional Location", "Structure indicator", "Description", 
+      "Start-up date", "Planning Plant", "Plant Section", "Work Center"
+    ],
+    // Template header standar untuk Func Loc + field tambahan umum
+    templateHeaders: [
+      "Functional Location", "Structure indicator", "Description", "Start-up date",
+      "Planning Plant", "Plant Section", "Work Center", "Sup. Funct. Loc.",
+      "Object Type", "ABC Indicator", "Sort Field", "Business Area", 
+      "Cost Center", "Room", "Position", "Maintenance Plant", "Location", 
+      "Main Work Center", "System Status", "User Status"
+    ]
+  }
+};
+
+// --- HELPER: SMART CSV PARSER ---
+const parseCSV = (text) => {
+  const lines = text.split('\n').filter(l => l.trim());
+  if (lines.length === 0) return [];
+
+  const firstLine = lines[0];
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  const semicolonCount = (firstLine.match(/;/g) || []).length;
+  const delimiter = semicolonCount > commaCount ? ';' : ',';
+
+  const headers = firstLine.split(delimiter).map(h => h.trim().replace(/^"|"$/g, ''));
+  const data = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const currentLine = lines[i];
+    // Skip metadata lines often found in SAP exports
+    if (
+        currentLine.includes("Alphanumeric") || 
+        currentLine.includes("Char Length") ||
+        currentLine.startsWith("Type" + delimiter) || 
+        currentLine.startsWith("1" + delimiter)
+    ) {
+        continue;
+    }
+
+    const row = {};
+    const regex = delimiter === ',' 
+        ? /,(?=(?:(?:[^"]*"){2})*[^"]*$)/ 
+        : /;(?=(?:(?:[^"]*"){2})*[^"]*$)/;
+        
+    const values = currentLine.split(regex);
+
+    headers.forEach((header, index) => {
+      let val = values[index] ? values[index].trim().replace(/^"|"$/g, '') : '';
+      if (header) { 
+        row[header] = val;
+      }
+    });
+    
+    if (Object.keys(row).length > 1) {
+      data.push(row);
+    }
+  }
+  return data;
+};
+
+// --- COMPONENT: STAT CARD ---
+const StatCard = ({ title, value, icon: Icon, color }) => (
+  <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex items-center space-x-4 transition-transform hover:scale-105">
+    <div className={`p-3 rounded-lg ${color} text-white shadow-lg shadow-slate-900/10`}>
+      <Icon size={24} />
+    </div>
+    <div>
+      <p className="text-sm text-slate-500 font-medium uppercase tracking-wide">{title}</p>
+      <h3 className="text-2xl font-bold text-slate-800">{value}</h3>
+    </div>
+  </div>
+);
+
+// --- MAIN APP COMPONENT ---
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [activeModule, setActiveModule] = useState(MODULES.EQUIPMENT); // STATE UTAMA UNTUK SWITCH MODUL
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [searchTerm, setSearchTerm] = useState('');
+  const [viewItem, setViewItem] = useState(null);
+  const [uploadStatus, setUploadStatus] = useState(null);
+
+  // Column Management
+  const [allColumns, setAllColumns] = useState([]);
+  const [visibleColumns, setVisibleColumns] = useState(new Set());
+  const [showColumnSelector, setShowColumnSelector] = useState(false);
+  const columnSelectorRef = useRef(null);
+
+  const config = MODULE_CONFIG[activeModule];
+
+  // --- AUTH & DATA FETCHING ---
+  useEffect(() => {
+    const initAuth = async () => {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInAnonymously(auth);
+        } else {
+            await signInAnonymously(auth);
+        }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Fetch Data Triggered by User or Module Change
+  useEffect(() => {
+    if(user) {
+        fetchData(user.uid);
+        // Reset selection & view when switching modules
+        setSelectedIds(new Set());
+        setSearchTerm('');
+        setUploadStatus(null);
+    }
+  }, [user, activeModule]);
+
+  // Tutup dropdown selector jika klik di luar
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (columnSelectorRef.current && !columnSelectorRef.current.contains(event.target)) {
+        setShowColumnSelector(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const fetchData = async (uid) => {
+    setLoading(true);
+    try {
+      const q = query(collection(db, 'artifacts', appId, 'users', uid, config.collection));
+      const querySnapshot = await getDocs(q);
+      const items = [];
+      const keysSet = new Set();
+
+      querySnapshot.forEach((doc) => {
+        const d = doc.data();
+        items.push({ id: doc.id, ...d });
+        Object.keys(d).forEach(k => {
+            if(k !== 'uploadedAt' && k !== 'id') keysSet.add(k);
+        });
+      });
+      
+      const uniqueKeys = Array.from(keysSet);
+      setAllColumns(uniqueKeys);
+      setData(items);
+
+      // --- LOGIKA PENENTUAN KOLOM DEFAULT ---
+      // Cek apakah kolom-kolom default yang dikonfigurasi ada di data yang ditarik
+      const defaults = uniqueKeys.filter(k => config.defaultCols.includes(k));
+      
+      if (defaults.length > 0) {
+        // Jika ada kolom yang cocok, gunakan itu
+        setVisibleColumns(new Set(defaults));
+      } else {
+         // Jika nama kolom di CSV beda total (tidak match config), fallback ambil 6 pertama
+         setVisibleColumns(new Set(uniqueKeys.slice(0, 6)));
+      }
+
+    } catch (error) {
+      console.error("Error fetching data:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- ACTIONS: UPLOAD ---
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    setUploadStatus(null);
+    setUploading(true);
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const text = e.target.result;
+        const parsedData = parseCSV(text);
+        
+        if (parsedData.length === 0) throw new Error("Data kosong atau format salah.");
+
+        const batchSize = 100;
+        for (let i = 0; i < parsedData.length; i += batchSize) {
+           const chunk = parsedData.slice(i, i + batchSize);
+           const batch = writeBatch(db);
+           chunk.forEach(item => {
+             const docRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, config.collection));
+             batch.set(docRef, { ...item, uploadedAt: new Date().toISOString() });
+           });
+           await batch.commit();
+        }
+        
+        await fetchData(user.uid);
+        setUploadStatus({ type: 'success', message: `Berhasil import ${parsedData.length} data ${config.name}.` });
+        setTimeout(() => setActiveTab('data'), 1500);
+
+      } catch (error) {
+        setUploadStatus({ type: 'error', message: error.message });
+      } finally {
+        setUploading(false);
+        event.target.value = null; 
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const downloadTemplate = () => {
+    const csvContent = "data:text/csv;charset=utf-8," + config.templateHeaders.join(",");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `template_${activeModule}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // --- ACTIONS: DELETE ---
+  const handleDelete = async () => {
+    if (selectedIds.size === 0) return;
+    if (!confirm(`Hapus ${selectedIds.size} data terpilih?`)) return;
+
+    setLoading(true);
+    try {
+      const batch = writeBatch(db);
+      selectedIds.forEach(id => {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, config.collection, id);
+        batch.delete(docRef);
+      });
+      await batch.commit();
+      setData(prev => prev.filter(item => !selectedIds.has(item.id)));
+      setSelectedIds(new Set());
+    } catch (error) {
+      alert("Gagal menghapus.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleSelection = (id) => {
+    const newSelection = new Set(selectedIds);
+    if (newSelection.has(id)) newSelection.delete(id);
+    else newSelection.add(id);
+    setSelectedIds(newSelection);
+  };
+
+  const toggleAll = () => {
+    setSelectedIds(selectedIds.size === filteredData.length ? new Set() : new Set(filteredData.map(d => d.id)));
+  };
+
+  const toggleColumn = (col) => {
+      const newCols = new Set(visibleColumns);
+      if (newCols.has(col)) newCols.delete(col);
+      else newCols.add(col);
+      setVisibleColumns(newCols);
+  };
+
+  // --- DATA PROCESSING ---
+  const filteredData = useMemo(() => {
+    return data.filter(item => 
+      Object.values(item).some(val => 
+        String(val).toLowerCase().includes(searchTerm.toLowerCase())
+      )
+    );
+  }, [data, searchTerm]);
+
+  // Sorting Columns based on Default Order first
+  const orderedVisibleColumns = useMemo(() => {
+      const active = Array.from(visibleColumns);
+      const order = config.defaultCols;
+
+      return active.sort((a, b) => {
+          const indexA = order.indexOf(a);
+          const indexB = order.indexOf(b);
+          if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+          if (indexA !== -1) return -1;
+          if (indexB !== -1) return 1;
+          return a.localeCompare(b);
+      });
+  }, [visibleColumns, config.defaultCols]);
+
+  // Analytics Calculation (Dynamic based on Module)
+  const stats = useMemo(() => {
+    const key1Count = {}; // Equipment: Manufacturer, FuncLoc: Planning Plant
+    const key2Count = {}; // Equipment: City, FuncLoc: Plant Section
+    
+    data.forEach(item => {
+      let k1 = "Unknown", k2 = "Unknown";
+
+      if (activeModule === MODULES.EQUIPMENT) {
+        k1 = (item["Manufacturer"] || "Unknown").trim();
+        k2 = (item["Plant Section (Kota/Kab)"] || item["City"] || "Unknown").trim();
+      } else {
+        k1 = (item["Planning Plant"] || "Unknown").trim();
+        k2 = (item["Plant Section"] || "Unknown").trim();
+      }
+      
+      key1Count[k1] = (key1Count[k1] || 0) + 1;
+      key2Count[k2] = (key2Count[k2] || 0) + 1;
+    });
+
+    return {
+        chart1Data: Object.keys(key1Count).map(k => ({ name: k, count: key1Count[k] })).sort((a,b) => b.count - a.count).slice(0, 5),
+        chart2Data: Object.keys(key2Count).map(k => ({ name: k, value: key2Count[k] })).sort((a,b) => b.value - a.value).slice(0, 5),
+        total: data.length
+    };
+  }, [data, activeModule]);
+
+  const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
+
+  if (!user) return <div className="h-screen flex items-center justify-center bg-slate-50 text-slate-400">Loading System...</div>;
+
+  return (
+    <div className="flex h-screen bg-slate-50 font-sans text-slate-800 overflow-hidden">
+      
+      {/* SIDEBAR */}
+      <aside className="w-64 bg-slate-900 text-white flex flex-col shadow-xl z-30 flex-shrink-0 transition-all">
+        <div className="p-6 border-b border-slate-800">
+          <div className="flex items-center space-x-2 mb-4">
+            <div className={`h-8 w-8 bg-${config.color}-500 rounded-lg flex items-center justify-center text-white font-bold`}>
+              {activeModule === MODULES.EQUIPMENT ? 'E' : 'F'}
+            </div>
+            <h1 className="text-lg font-bold tracking-tight text-white">Asset<span className={`text-${config.color}-400`}>Master</span></h1>
+          </div>
+          
+          {/* MODULE SWITCHER */}
+          <div className="space-y-2">
+            <label className="text-[10px] uppercase text-slate-500 font-semibold tracking-wider">Active Module</label>
+            <div className="flex flex-col space-y-1">
+                <button 
+                    onClick={() => setActiveModule(MODULES.EQUIPMENT)}
+                    className={`flex items-center space-x-3 px-3 py-2 rounded-lg text-sm transition-all ${activeModule === MODULES.EQUIPMENT ? 'bg-blue-600 text-white font-medium' : 'text-slate-400 hover:bg-slate-800'}`}
+                >
+                    <Box size={16}/> <span>Equipment</span>
+                </button>
+                <button 
+                    onClick={() => setActiveModule(MODULES.FUNCLOC)}
+                    className={`flex items-center space-x-3 px-3 py-2 rounded-lg text-sm transition-all ${activeModule === MODULES.FUNCLOC ? 'bg-emerald-600 text-white font-medium' : 'text-slate-400 hover:bg-slate-800'}`}
+                >
+                    <MapPin size={16}/> <span>Functional Location</span>
+                </button>
+            </div>
+          </div>
+        </div>
+
+        <nav className="flex-1 p-4 space-y-1">
+          <p className="px-4 pb-2 text-[10px] uppercase text-slate-500 font-semibold tracking-wider">Menu</p>
+          {[
+            { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+            { id: 'data', icon: TableIcon, label: 'Data Master' },
+            { id: 'upload', icon: UploadCloud, label: 'Import CSV' },
+          ].map((item) => (
+            <button 
+              key={item.id}
+              onClick={() => setActiveTab(item.id)} 
+              className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-all ${
+                activeTab === item.id 
+                ? `bg-slate-800 text-${config.color}-400 shadow-md border-l-4 border-${config.color}-500` 
+                : 'text-slate-300 hover:bg-slate-800/50'
+              }`}
+            >
+              <item.icon size={18} /> <span>{item.label}</span>
+            </button>
+          ))}
+        </nav>
+      </aside>
+
+      {/* MAIN CONTENT */}
+      <main className="flex-1 flex flex-col h-full relative overflow-hidden bg-slate-50">
+        
+        {/* TOP BAR */}
+        <header className="px-8 py-5 flex justify-between items-center bg-white border-b border-slate-200 flex-shrink-0">
+          <div>
+            <h2 className="text-2xl font-bold text-slate-800 capitalize flex items-center space-x-2">
+                {activeTab === 'upload' ? <UploadCloud className={`text-${config.color}-500 mr-2`} /> :
+                 activeTab === 'dashboard' ? <LayoutDashboard className={`text-${config.color}-500 mr-2`} /> :
+                 <TableIcon className={`text-${config.color}-500 mr-2`} />}
+                <span>{activeTab.replace('-', ' ')}</span>
+            </h2>
+            <p className="text-sm text-slate-500 mt-1">Modul: <span className={`font-semibold text-${config.color}-600`}>{config.name}</span></p>
+          </div>
+          <div className="flex items-center space-x-3">
+             <div className="bg-slate-100 px-3 py-1 rounded-full text-xs font-semibold text-slate-600">Starlink Project</div>
+             <div className={`h-8 w-8 bg-${config.color}-100 text-${config.color}-700 rounded-full flex items-center justify-center font-bold`}>U</div>
+          </div>
+        </header>
+
+        {/* CONTENT AREA */}
+        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+            
+            {/* DASHBOARD VIEW */}
+            {activeTab === 'dashboard' && (
+              <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <StatCard title={`Total ${config.name}`} value={stats.total} icon={Layers} color={`bg-${config.color}-500`} />
+                  <StatCard 
+                    title={activeModule === MODULES.EQUIPMENT ? "Top Brand" : "Top Planning Plant"} 
+                    value={stats.chart1Data[0]?.name || '-'} 
+                    icon={BarChart3} 
+                    color="bg-indigo-500" 
+                  />
+                  <StatCard 
+                    title={activeModule === MODULES.EQUIPMENT ? "Top Kota" : "Top Section"} 
+                    value={stats.chart2Data[0]?.name || '-'} 
+                    icon={PieChart} 
+                    color="bg-orange-500" 
+                  />
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 h-96 flex flex-col">
+                    <h3 className="font-bold text-slate-700 mb-6">
+                        {activeModule === MODULES.EQUIPMENT ? "Distribusi Manufaktur" : "Distribusi Planning Plant"}
+                    </h3>
+                    <div className="flex-1">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={stats.chart1Data} layout="vertical">
+                          <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} />
+                          <XAxis type="number" hide />
+                          <YAxis dataKey="name" type="category" width={120} tick={{fontSize: 11}} />
+                          <RechartsTooltip cursor={{fill: '#f8fafc'}} />
+                          <Bar dataKey="count" fill={activeModule === MODULES.EQUIPMENT ? "#3b82f6" : "#10b981"} radius={[0, 4, 4, 0]} barSize={24} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 h-96 flex flex-col">
+                    <h3 className="font-bold text-slate-700 mb-6">
+                        {activeModule === MODULES.EQUIPMENT ? "Sebaran Kota" : "Sebaran Plant Section"}
+                    </h3>
+                    <div className="flex-1">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <RePieChart>
+                          <Pie data={stats.chart2Data} cx="50%" cy="50%" innerRadius={60} outerRadius={100} paddingAngle={5} dataKey="value">
+                            {stats.chart2Data.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
+                          </Pie>
+                          <RechartsTooltip />
+                          <Legend verticalAlign="bottom" height={36}/>
+                        </RePieChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* UPLOAD VIEW */}
+            {activeTab === 'upload' && (
+              <div className="max-w-2xl mx-auto animate-in zoom-in-95 duration-300">
+                 <div className="bg-white p-10 rounded-3xl shadow-lg border border-slate-100 text-center space-y-8">
+                   {uploadStatus && (
+                       <div className={`p-4 rounded-xl flex items-center justify-center space-x-2 text-sm font-medium ${
+                           uploadStatus.type === 'success' ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'
+                       }`}>
+                           {uploadStatus.type === 'success' ? <CheckCircle2 size={20}/> : <AlertCircle size={20}/>}
+                           <span>{uploadStatus.message}</span>
+                       </div>
+                   )}
+                   <div>
+                     <div className={`mx-auto h-24 w-24 bg-${config.color}-50 text-${config.color}-500 rounded-full flex items-center justify-center mb-4`}><UploadCloud size={48} /></div>
+                     <h3 className="text-2xl font-bold text-slate-800">Upload {config.name}</h3>
+                     <p className="text-slate-500 mt-2">Pastikan menggunakan template yang sesuai untuk modul ini.</p>
+                   </div>
+                   <div className="flex justify-center space-x-4">
+                     <button onClick={downloadTemplate} className="flex items-center space-x-2 px-6 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full text-sm font-medium transition-colors">
+                       <FileDown size={18} /> <span>Download Template {config.name}</span>
+                     </button>
+                   </div>
+                   <div className={`border-2 border-dashed rounded-2xl p-12 transition-all cursor-pointer relative ${uploading ? 'bg-slate-50 border-slate-300' : `border-${config.color}-300 hover:border-${config.color}-500 hover:bg-${config.color}-50`}`}>
+                     <input type="file" accept=".csv" onChange={handleFileUpload} disabled={uploading} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
+                     {uploading ? (
+                       <div className={`text-${config.color}-600 font-medium`}>Memproses data...</div>
+                     ) : (
+                       <div className="text-slate-500"><span className={`text-${config.color}-600 font-bold text-lg block mb-1`}>Pilih File CSV</span>Drag & Drop Supported</div>
+                     )}
+                   </div>
+                 </div>
+              </div>
+            )}
+
+            {/* DATA VIEW */}
+            {activeTab === 'data' && (
+              <div className="bg-white rounded-xl shadow-sm border border-slate-100 flex flex-col h-[calc(100vh-180px)] animate-in fade-in duration-300">
+                
+                {/* TOOLBAR */}
+                <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-white rounded-t-xl sticky top-0 z-30">
+                  <div className="flex items-center space-x-3 w-1/3">
+                     <div className="relative w-full">
+                        <Search className="absolute left-3 top-2.5 text-slate-400" size={18} />
+                        <input 
+                          type="text" 
+                          placeholder={`Cari data ${config.name}...`} 
+                          className="w-full pl-10 pr-4 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          value={searchTerm}
+                          onChange={(e) => setSearchTerm(e.target.value)}
+                        />
+                     </div>
+                  </div>
+                  
+                  <div className="flex items-center space-x-3">
+                     {/* COLUMN TOGGLER */}
+                     <div className="relative" ref={columnSelectorRef}>
+                        <button 
+                            onClick={() => setShowColumnSelector(!showColumnSelector)}
+                            className="flex items-center space-x-2 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                        >
+                            <SlidersHorizontal size={16}/> <span>Kolom ({visibleColumns.size}/{allColumns.length})</span>
+                        </button>
+                        
+                        {showColumnSelector && (
+                            <div className="absolute right-0 mt-2 w-72 max-h-96 overflow-y-auto bg-white rounded-xl shadow-xl border border-slate-200 z-50 p-2 custom-scrollbar">
+                                <div className="p-2 border-b border-slate-100 mb-2">
+                                    <h4 className="text-xs font-bold text-slate-500 uppercase">Pilih Kolom Tampil</h4>
+                                </div>
+                                {allColumns.map(col => (
+                                    <label key={col} className="flex items-center space-x-3 p-2 hover:bg-slate-50 rounded cursor-pointer">
+                                        <input 
+                                            type="checkbox" 
+                                            checked={visibleColumns.has(col)} 
+                                            onChange={() => toggleColumn(col)}
+                                            className={`rounded border-slate-300 text-${config.color}-600 focus:ring-${config.color}-500`}
+                                        />
+                                        <span className="text-sm text-slate-700 truncate" title={col}>{col}</span>
+                                    </label>
+                                ))}
+                            </div>
+                        )}
+                     </div>
+
+                     {selectedIds.size > 0 && (
+                       <button onClick={handleDelete} className="flex items-center space-x-2 px-4 py-2 bg-red-50 text-red-600 hover:bg-red-100 rounded-lg text-sm font-medium transition-colors">
+                         <Trash2 size={16} /> <span>Hapus ({selectedIds.size})</span>
+                       </button>
+                     )}
+                  </div>
+                </div>
+
+                {/* TABLE CONTAINER */}
+                <div className="overflow-auto flex-1 custom-scrollbar relative">
+                  <table className="w-full text-left border-collapse min-w-max">
+                    <thead className="bg-slate-50 text-xs font-semibold text-slate-500 uppercase sticky top-0 z-20 shadow-sm">
+                      <tr>
+                        {/* CHECKBOX */}
+                        <th className="p-4 w-12 text-center sticky left-0 bg-slate-50 z-20 border-r border-slate-200 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]">
+                           <button onClick={toggleAll} className="text-slate-400 hover:text-slate-600">
+                             {selectedIds.size > 0 && selectedIds.size === filteredData.length ? <CheckSquare size={18} className={`text-${config.color}-600`}/> : <Square size={18}/>}
+                           </button>
+                        </th>
+                        
+                        {/* FIRST COLUMN (STICKY) */}
+                        {orderedVisibleColumns.length > 0 && (
+                             <th className="p-4 sticky left-12 bg-slate-50 z-20 border-r border-slate-200 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)] min-w-[150px]">
+                                {orderedVisibleColumns[0]}
+                             </th>
+                        )}
+
+                        {/* OTHER COLUMNS */}
+                        {orderedVisibleColumns.slice(1).map(col => (
+                            <th key={col} className="p-4 whitespace-nowrap min-w-[150px]">{col}</th>
+                        ))}
+                        
+                        <th className="p-4 text-right bg-slate-50 sticky right-0 z-20 border-l border-slate-200">Detail</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-sm text-slate-600">
+                      {loading ? (
+                         <tr><td colSpan="100" className="p-12 text-center text-slate-400">Loading Data...</td></tr>
+                      ) : filteredData.length === 0 ? (
+                         <tr><td colSpan="100" className="p-12 text-center text-slate-400">Tidak ada data di modul ini.</td></tr>
+                      ) : (
+                        filteredData.map((item) => (
+                          <tr key={item.id} className={`hover:bg-${config.color}-50/40 transition-colors group`}>
+                            
+                            {/* CHECKBOX CELL */}
+                            <td className="p-4 text-center sticky left-0 bg-white group-hover:bg-gray-50 z-10 border-r border-slate-100">
+                              <button onClick={() => toggleSelection(item.id)} className={`${selectedIds.has(item.id) ? `text-${config.color}-600` : 'text-slate-300'}`}>
+                                {selectedIds.has(item.id) ? <CheckSquare size={18}/> : <Square size={18}/>}
+                              </button>
+                            </td>
+
+                            {/* FIRST COL CELL */}
+                            {orderedVisibleColumns.length > 0 && (
+                                <td className="p-4 font-medium text-slate-800 sticky left-12 bg-white group-hover:bg-gray-50 z-10 border-r border-slate-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
+                                    {item[orderedVisibleColumns[0]] || '-'}
+                                </td>
+                            )}
+
+                            {/* OTHER CELLS */}
+                            {orderedVisibleColumns.slice(1).map(col => (
+                                <td key={`${item.id}-${col}`} className="p-4 whitespace-nowrap max-w-xs truncate" title={item[col]}>
+                                    {item[col] || '-'}
+                                </td>
+                            ))}
+
+                            <td className="p-4 text-right sticky right-0 bg-white group-hover:bg-gray-50 z-10 border-l border-slate-100">
+                              <button onClick={() => setViewItem(item)} className={`p-2 text-${config.color}-500 hover:bg-${config.color}-100 rounded-lg`}>
+                                <Eye size={18} />
+                              </button>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+        </div>
+      </main>
+
+      {/* DETAIL MODAL */}
+      {viewItem && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-hidden flex flex-col">
+              <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                 <div>
+                   <h3 className="text-xl font-bold text-slate-800">Detail {config.name}</h3>
+                   <p className={`text-sm text-${config.color}-600 font-mono mt-1`}>ID: {viewItem.id}</p>
+                 </div>
+                 <button onClick={() => setViewItem(null)} className="p-2 hover:bg-slate-200 rounded-full"><X size={24} className="text-slate-500" /></button>
+              </div>
+              <div className="p-6 overflow-y-auto custom-scrollbar">
+                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {Object.entries(viewItem).map(([key, val]) => {
+                      if (key === 'id' || key === 'uploadedAt') return null;
+                      return (
+                        <div key={key} className="space-y-1">
+                          <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{key}</label>
+                          <div className="text-sm text-slate-800 break-words p-2 rounded bg-slate-50 border border-slate-100 min-h-[36px]">
+                            {String(val || '-')}
+                          </div>
+                        </div>
+                      )
+                    })}
+                 </div>
+              </div>
+              <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end">
+                 <button onClick={() => setViewItem(null)} className="px-6 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900">Tutup</button>
+              </div>
+           </div>
+        </div>
+      )}
+
+      <style jsx global>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+      `}</style>
+    </div>
+  );
+}
